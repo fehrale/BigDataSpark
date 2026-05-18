@@ -85,3 +85,15 @@
 7. Код Apache Spark трансформации данных из снежинки/звезды в отчеты в Neo4j.
 8. Код Apache Spark трансформации данных из снежинки/звезды в отчеты в MongoDB.
 9. Код Apache Spark трансформации данных из снежинки/звезды в отчеты в Valkey.
+
+
+## Запуск пайплайна (минимум: PostgreSQL + ClickHouse)
+
+1. Из корня репозитория: `docker compose up -d --build` — Postgres инициализируется скриптами **`sql/docker-init`** (`01_*` таблица `mock_data`, CSV, DDL, **`04_dw_load.sql`** заполняет `snowflake`); Jupyter + Spark (**`jupyter/pyspark-notebook`**, Lab **`8888`**, токен **`spark`**; Spark UI во время джобы — **`4040`**); ClickHouse (`8123`).
+2. Полный прогон одной командой (оркестратор вызывает Spark внутри контейнера и проверяет отчёты по HTTP):
+
+   `py run_pipeline.py`
+
+   Параметры: `--skip-up`, `--skip-etl-star`, `--skip-etl-clickhouse`, `--skip-smoke`.
+
+3. Проверка витрин в ClickHouse (DBeaver или HTTP): `http://localhost:8123/?query=SELECT%20*%20FROM%20report_products%20LIMIT%205`

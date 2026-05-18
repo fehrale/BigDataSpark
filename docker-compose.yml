@@ -1,0 +1,56 @@
+services:
+  postgres:
+    build:
+      context: ./sql/docker-init
+      dockerfile: Dockerfile
+    container_name: snowflake-db
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: snowflake
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./исходные данные:/csv:ro
+    networks:
+      - bigdata_net
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: bigdata_clickhouse
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    networks:
+      - bigdata_net
+
+  spark:
+    image: jupyter/pyspark-notebook:latest
+    container_name: bigdata_spark
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - JUPYTER_TOKEN=spark
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=clickhouse
+    ports:
+      - "8888:8888"
+      - "4040:4040"
+    volumes:
+      - ./:/home/jovyan/work
+    networks:
+      - bigdata_net
+    depends_on:
+      - postgres
+      - clickhouse
+
+networks:
+  bigdata_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
