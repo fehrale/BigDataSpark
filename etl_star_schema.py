@@ -53,6 +53,10 @@ def main():
     spark = (
         SparkSession.builder.appName("ETL_star_schema")
         .config("spark.jars.packages", PG_PACKAGES)
+        .config("spark.driver.memory", "512m")
+        .config("spark.executor.memory", "512m")
+        .config("spark.driver.maxResultSize", "256m")
+        .config("spark.sql.shuffle.partitions", "10")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")

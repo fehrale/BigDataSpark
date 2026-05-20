@@ -1,8 +1,13 @@
+"""
+Spark ETL: snowflake star schema (PostgreSQL) -> 18 ClickHouse tables.
+6 отчётов × 3 таблицы = 18. Каждая пуля README — отдельная таблица.
+Top-N через .orderBy().limit() — без Window без partitionBy.
+"""
+
 import os
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.window import Window
 
 PG_CONN = os.environ.get("POSTGRES_JDBC_URL", "jdbc:postgresql://postgres:5432/snowflake")
 CH_CONN = os.environ.get(
@@ -14,18 +19,8 @@ PG_PASS = os.environ.get("POSTGRES_PASSWORD", "password")
 CH_USER = os.environ.get("CLICKHOUSE_USER", "default")
 CH_PASS = os.environ.get("CLICKHOUSE_PASSWORD", "clickhouse")
 
-PG_PROPS = {
-    "user": PG_USER,
-    "password": PG_PASS,
-    "driver": "org.postgresql.Driver",
-}
-
-CH_PROPS = {
-    "user": CH_USER,
-    "password": CH_PASS,
-    "driver": "com.clickhouse.jdbc.ClickHouseDriver",
-}
-
+PG_PROPS = {"user": PG_USER, "password": PG_PASS, "driver": "org.postgresql.Driver"}
+CH_PROPS = {"user": CH_USER, "password": CH_PASS, "driver": "com.clickhouse.jdbc.ClickHouseDriver"}
 PACKAGES = "org.postgresql:postgresql:42.7.4,com.clickhouse:clickhouse-jdbc:0.4.6"
 
 
@@ -35,107 +30,161 @@ def read_sf(spark: SparkSession, sql: str):
 
 def write_ch(df, table: str) -> None:
     df.write.jdbc(CH_CONN, table, mode="overwrite", properties=CH_PROPS)
-    print(f"wrote ClickHouse.{table}")
+    print(f"  wrote {table}")
 
 
 def main():
     spark = (
         SparkSession.builder.appName("ETL_ClickHouse_reports")
         .config("spark.jars.packages", PACKAGES)
+        .config("spark.driver.memory", "512m")
+        .config("spark.executor.memory", "512m")
+        .config("spark.driver.maxResultSize", "256m")
+        .config("spark.sql.shuffle.partitions", "10")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
 
-    ft = read_sf(spark, "SELECT * FROM snowflake.fact_transactions")
+    ft = read_sf(spark, "SELECT * FROM snowflake.fact_transactions").cache()
     it = read_sf(spark, "SELECT * FROM snowflake.dim_item").alias("i")
     bu = read_sf(spark, "SELECT * FROM snowflake.dim_buyer").alias("b")
     sh = read_sf(spark, "SELECT * FROM snowflake.dim_shop").alias("sh")
     ve = read_sf(spark, "SELECT * FROM snowflake.dim_vendor").alias("v")
     co = read_sf(spark, "SELECT * FROM snowflake.dim_country").alias("c")
 
-    # products
-    base_pi = ft.join(it, ["item_id"], "inner")
-    prod_sales = (
+    # ── 1. PRODUCTS ───────────────────────────────────────────────────────────
+    print("1. Products")
+    base_pi = ft.join(it, ["item_id"], "inner").cache()
+
+    prod_agg = (
         base_pi.groupBy("item_id", "item_name", "category")
         .agg(
             F.sum("quantity").alias("total_units_sold"),
             F.sum("total_amount").alias("total_revenue"),
+        )
+        .withColumnRenamed("item_name", "product_name")
+        .withColumnRenamed("category", "product_category")
+        .cache()
+    )
+    # топ-10 самых продаваемых
+    write_ch(prod_agg.orderBy(F.desc("total_units_sold")).limit(10), "report_products_top10")
+    # выручка по категориям
+    write_ch(
+        base_pi.groupBy(F.col("category").alias("product_category")).agg(
+            F.sum("total_amount").alias("category_revenue"),
+            F.sum("quantity").alias("total_units_sold"),
+        ),
+        "report_products_by_category",
+    )
+    # рейтинг и отзывы по каждому продукту
+    write_ch(
+        base_pi.groupBy("item_id", "item_name", "category")
+        .agg(
             F.avg("rating").alias("avg_rating"),
             F.avg(F.col("reviews_count").cast("double")).alias("avg_reviews"),
         )
         .withColumnRenamed("item_name", "product_name")
-        .withColumnRenamed("category", "product_category")
+        .withColumnRenamed("category", "product_category"),
+        "report_products_ratings",
     )
-    category_revenue = base_pi.groupBy(F.col("category").alias("product_category")).agg(
-        F.sum("total_amount").alias("category_revenue")
-    )
-    w_units = Window.orderBy(F.desc("total_units_sold"))
-    report_products = (
-        prod_sales.join(category_revenue, "product_category")
-        .withColumn("rank_by_units", F.rank().over(w_units))
-        .withColumn("is_top10", F.col("rank_by_units") <= 10)
-    )
-    write_ch(report_products, "report_products")
+    base_pi.unpersist()
+    prod_agg.unpersist()
 
-    # сustomers 
+    # ── 2. CUSTOMERS ──────────────────────────────────────────────────────────
+    print("2. Customers")
     bu_f = bu.select(
         "buyer_id",
         F.col("first_name").alias("buyer_first_name"),
         F.col("last_name").alias("buyer_last_name"),
         F.col("country_id").alias("buyer_country_id"),
     )
-    buyer_ct = ft.join(bu_f, ["buyer_id"], "inner").join(
-        co.alias("bc"), F.col("buyer_country_id") == F.col("bc.country_id"), "left"
+    cust_agg = (
+        ft.join(bu_f, ["buyer_id"], "inner")
+        .join(co.alias("bc"), F.col("buyer_country_id") == F.col("bc.country_id"), "left")
+        .groupBy(
+            "buyer_id",
+            "buyer_first_name",
+            "buyer_last_name",
+            F.coalesce(F.col("bc.country_name"), F.lit("Unknown")).alias("buyer_country"),
+        )
+        .agg(
+            F.sum("total_amount").alias("total_spent"),
+            F.countDistinct("transaction_id").alias("order_count"),
+            F.avg("total_amount").alias("avg_check"),
+        )
+        .cache()
     )
-    cust_sales = buyer_ct.groupBy(
-        "buyer_id",
-        "buyer_first_name",
-        "buyer_last_name",
-        F.coalesce(F.col("bc.country_name"), F.lit("Unknown")).alias("buyer_country"),
-    ).agg(
-        F.sum("total_amount").alias("total_spent"),
-        F.countDistinct("transaction_id").alias("order_count"),
-        F.avg("total_amount").alias("avg_check"),
+    # топ-10 по сумме покупок
+    write_ch(cust_agg.orderBy(F.desc("total_spent")).limit(10), "report_customers_top10")
+    # распределение по странам
+    write_ch(
+        cust_agg.groupBy("buyer_country").agg(
+            F.count("buyer_id").alias("customer_count"),
+            F.sum("total_spent").alias("country_total_spent"),
+        ),
+        "report_customers_by_country",
     )
-    country_dist = cust_sales.groupBy("buyer_country").agg(F.count("buyer_id").alias("customers_in_country"))
-    w_spend = Window.orderBy(F.desc("total_spent"))
-    report_customers = (
-        cust_sales.join(country_dist, "buyer_country")
-        .withColumn("rank_by_spend", F.rank().over(w_spend))
-        .withColumn("is_top10", F.col("rank_by_spend") <= 10)
+    # средний чек для каждого клиента
+    write_ch(
+        cust_agg.select("buyer_id", "buyer_first_name", "buyer_last_name", "buyer_country", "avg_check", "order_count"),
+        "report_customers_avg_check",
     )
-    write_ch(report_customers, "report_customers")
+    cust_agg.unpersist()
 
-    # time
-    ft_dates = ft.select(
-        "transaction_id",
-        "quantity",
-        "total_amount",
-        F.year("sale_date").alias("year"),
-        F.month("sale_date").alias("month"),
-    ).where(F.col("sale_date").isNotNull())
-    time_sales = ft_dates.groupBy("year", "month").agg(
-        F.sum("total_amount").alias("monthly_revenue"),
-        F.countDistinct("transaction_id").alias("order_count"),
-        F.avg("total_amount").alias("avg_order_size"),
-        F.sum("quantity").alias("total_units"),
+    # ── 3. TIME ───────────────────────────────────────────────────────────────
+    print("3. Time")
+    ft_dates = (
+        ft.select(
+            "transaction_id", "quantity", "total_amount",
+            F.year("sale_date").alias("year"),
+            F.month("sale_date").alias("month"),
+            F.dayofweek("sale_date").alias("weekday"),
+        )
+        .where(F.col("sale_date").isNotNull())
+        .cache()
     )
-    yearly = ft_dates.groupBy("year").agg(F.sum("total_amount").alias("yearly_revenue"))
-    report_time = time_sales.join(yearly, "year")
-    write_ch(report_time, "report_time")
+    # месячные тренды
+    write_ch(
+        ft_dates.groupBy("year", "month").agg(
+            F.sum("total_amount").alias("monthly_revenue"),
+            F.countDistinct("transaction_id").alias("order_count"),
+            F.avg("total_amount").alias("avg_order_size"),
+            F.sum("quantity").alias("total_units"),
+        ),
+        "report_time_monthly",
+    )
+    # годовые тренды (сравнение периодов)
+    write_ch(
+        ft_dates.groupBy("year").agg(
+            F.sum("total_amount").alias("yearly_revenue"),
+            F.countDistinct("transaction_id").alias("yearly_orders"),
+            F.sum("quantity").alias("yearly_units"),
+        ),
+        "report_time_yearly",
+    )
+    # средний размер заказа по дням недели
+    write_ch(
+        ft_dates.groupBy("weekday").agg(
+            F.avg("total_amount").alias("avg_order_size"),
+            F.sum("total_amount").alias("total_revenue"),
+            F.countDistinct("transaction_id").alias("order_count"),
+        ),
+        "report_time_weekday",
+    )
+    ft_dates.unpersist()
 
-    # stores
+    # ── 4. STORES ─────────────────────────────────────────────────────────────
+    print("4. Stores")
     sh_f = sh.select(
         "shop_id",
         F.col("shop_name").alias("store_name"),
         F.col("city").alias("store_city"),
         F.col("country_id").alias("shop_country_id"),
     )
-    base_shop = ft.join(sh_f, ["shop_id"], "inner").join(
-        co.alias("sc"), F.col("shop_country_id") == F.col("sc.country_id"), "left"
-    )
-    store_sales = (
-        base_shop.groupBy(
+    store_agg = (
+        ft.join(sh_f, ["shop_id"], "inner")
+        .join(co.alias("sc"), F.col("shop_country_id") == F.col("sc.country_id"), "left")
+        .groupBy(
             "shop_id",
             "store_name",
             "store_city",
@@ -146,88 +195,95 @@ def main():
             F.countDistinct("transaction_id").alias("order_count"),
             F.avg("total_amount").alias("avg_check"),
         )
+        .cache()
     )
-    city_dist_s = store_sales.groupBy("store_city").agg(F.sum("total_revenue").alias("city_revenue"))
-    country_dist_shop = store_sales.groupBy("store_country").agg(
-        F.sum("total_revenue").alias("country_revenue")
+    # топ-5 по выручке
+    write_ch(store_agg.orderBy(F.desc("total_revenue")).limit(5), "report_stores_top5")
+    # распределение по городам
+    write_ch(
+        store_agg.groupBy("store_city").agg(
+            F.sum("total_revenue").alias("city_revenue"),
+            F.countDistinct("shop_id").alias("store_count"),
+            F.sum("order_count").alias("total_orders"),
+        ),
+        "report_stores_by_city",
     )
-    w_store = Window.orderBy(F.desc("total_revenue"))
-    report_stores = (
-        store_sales.join(city_dist_s, "store_city")
-        .join(country_dist_shop, "store_country")
-        .withColumn("rank_by_revenue", F.rank().over(w_store))
-        .withColumn("is_top5", F.col("rank_by_revenue") <= 5)
+    # распределение по странам
+    write_ch(
+        store_agg.groupBy("store_country").agg(
+            F.sum("total_revenue").alias("country_revenue"),
+            F.countDistinct("shop_id").alias("store_count"),
+        ),
+        "report_stores_by_country",
     )
-    write_ch(report_stores, "report_stores")
+    store_agg.unpersist()
 
-    # suppliers
-    it_v = it.select(
-        "item_id",
-        "item_name",
-        "category",
-        "price",
-        "rating",
-        "reviews_count",
-        F.col("vendor_id").alias("item_vendor_id"),
-    )
+    # ── 5. SUPPLIERS ──────────────────────────────────────────────────────────
+    print("5. Suppliers")
+    it_v = it.select("item_id", "item_name", "category", "price", "vendor_id")
     ve_k = ve.select(
         F.col("vendor_id").alias("sup_vendor_id"),
         F.col("vendor_name"),
         F.col("country_id").alias("sup_country_id"),
     )
-    base_sv = ft.join(it_v, ["item_id"], "inner").join(
-        ve_k, F.col("item_vendor_id") == F.col("sup_vendor_id"), "inner"
+    supp_agg = (
+        ft.join(it_v, ["item_id"], "inner")
+        .join(ve_k, F.col("vendor_id") == F.col("sup_vendor_id"), "inner")
+        .join(co.alias("vc"), F.col("sup_country_id") == F.col("vc.country_id"), "left")
+        .groupBy(
+            F.col("sup_vendor_id").alias("vendor_id"),
+            F.col("vendor_name").alias("supplier_name"),
+            F.coalesce(F.col("vc.country_name"), F.lit("Unknown")).alias("supplier_country"),
+        )
+        .agg(
+            F.sum("total_amount").alias("total_revenue"),
+            F.avg(F.col("price").cast("double")).alias("avg_product_price"),
+            F.countDistinct("transaction_id").alias("order_count"),
+        )
+        .cache()
     )
-    supplier_ct = base_sv.join(co.alias("vc"), F.col("sup_country_id") == F.col("vc.country_id"), "left")
-    supp_sales = supplier_ct.groupBy(
-        F.col("sup_vendor_id").alias("vendor_id"),
-        F.col("vendor_name").alias("supplier_name"),
-        F.coalesce(F.col("vc.country_name"), F.lit("Unknown")).alias("supplier_country"),
-    ).agg(
-        F.sum("total_amount").alias("total_revenue"),
-        F.avg(F.col("price").cast("double")).alias("avg_product_price"),
-        F.countDistinct("transaction_id").alias("order_count"),
+    # топ-5 по выручке
+    write_ch(supp_agg.orderBy(F.desc("total_revenue")).limit(5), "report_suppliers_top5")
+    # средняя цена товаров по поставщику
+    write_ch(
+        supp_agg.select("vendor_id", "supplier_name", "supplier_country", "avg_product_price", "order_count"),
+        "report_suppliers_avg_price",
     )
-    supp_country_dist = supp_sales.groupBy("supplier_country").agg(
-        F.sum("total_revenue").alias("country_revenue")
+    # распределение по странам поставщиков
+    write_ch(
+        supp_agg.groupBy("supplier_country").agg(
+            F.sum("total_revenue").alias("total_revenue"),
+            F.countDistinct("vendor_id").alias("supplier_count"),
+        ),
+        "report_suppliers_by_country",
     )
-    w_supp = Window.orderBy(F.desc("total_revenue"))
-    report_suppliers = (
-        supp_sales.join(supp_country_dist, "supplier_country")
-        .withColumn("rank_by_revenue", F.rank().over(w_supp))
-        .withColumn("is_top5", F.col("rank_by_revenue") <= 5)
-    )
-    write_ch(report_suppliers, "report_suppliers")
+    supp_agg.unpersist()
 
-    # quality
-    qb = ft.join(it, ["item_id"], "inner").select(
-        "item_id",
-        F.col("item_name").alias("product_name"),
-        F.col("category").alias("product_category"),
-        F.col("rating"),
-        F.col("reviews_count"),
-        F.col("quantity"),
-        F.col("total_amount"),
+    # ── 6. QUALITY ────────────────────────────────────────────────────────────
+    print("6. Quality")
+    qual_agg = (
+        ft.join(it, ["item_id"], "inner")
+        .groupBy("item_id", "item_name", "category")
+        .agg(
+            F.avg("rating").alias("avg_rating"),
+            F.avg(F.col("reviews_count").cast("double")).alias("avg_reviews"),
+            F.sum("quantity").alias("total_units_sold"),
+            F.sum("total_amount").alias("total_revenue"),
+        )
+        .withColumnRenamed("item_name", "product_name")
+        .withColumnRenamed("category", "product_category")
+        .cache()
     )
-    qual = qb.groupBy("item_id", "product_name", "product_category").agg(
-        F.avg("rating").alias("avg_rating"),
-        F.avg(F.col("reviews_count").cast("double")).alias("avg_reviews"),
-        F.sum("quantity").alias("total_units_sold"),
-        F.sum("total_amount").alias("total_revenue"),
-    )
-    wrd = Window.orderBy(F.desc("avg_rating"))
-    wra = Window.orderBy(F.asc("avg_rating"))
-    wrev = Window.orderBy(F.desc("avg_reviews"))
-    corr_row = qual.agg(F.corr(F.col("avg_rating"), F.col("total_units_sold")).alias("rating_vs_units_corr")).limit(1)
-    report_quality = (
-        qual.withColumn("rank_by_rating_high", F.rank().over(wrd))
-        .withColumn("rank_by_rating_low", F.rank().over(wra))
-        .withColumn("rank_by_reviews", F.rank().over(wrev))
-        .crossJoin(corr_row)
-    )
-    write_ch(report_quality, "report_quality")
+    # наивысший рейтинг
+    write_ch(qual_agg.orderBy(F.desc("avg_rating")).limit(10), "report_quality_top_rated")
+    # наименьший рейтинг
+    write_ch(qual_agg.orderBy(F.asc("avg_rating")).limit(10), "report_quality_low_rated")
+    # наибольшее число отзывов
+    write_ch(qual_agg.orderBy(F.desc("avg_reviews")).limit(10), "report_quality_most_reviewed")
+    qual_agg.unpersist()
 
-    print("All 6 ClickHouse reports created.")
+    ft.unpersist()
+    print("All 18 ClickHouse tables created.")
     spark.stop()
 
 

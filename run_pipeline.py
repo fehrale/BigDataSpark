@@ -1,5 +1,3 @@
-"""Orchestration: compose up + Spark jobs + HTTP smoke queries to ClickHouse."""
-
 from __future__ import annotations
 
 import argparse
@@ -155,12 +153,24 @@ def main() -> int:
 
     if not args.skip_smoke:
         for t in (
-            "report_products",
-            "report_customers",
-            "report_time",
-            "report_stores",
-            "report_suppliers",
-            "report_quality",
+            "report_products_top10",
+            "report_products_by_category",
+            "report_products_ratings",
+            "report_customers_top10",
+            "report_customers_by_country",
+            "report_customers_avg_check",
+            "report_time_monthly",
+            "report_time_yearly",
+            "report_time_weekday",
+            "report_stores_top5",
+            "report_stores_by_city",
+            "report_stores_by_country",
+            "report_suppliers_top5",
+            "report_suppliers_avg_price",
+            "report_suppliers_by_country",
+            "report_quality_top_rated",
+            "report_quality_low_rated",
+            "report_quality_most_reviewed",
         ):
             cnt = clickhouse_scalar(f"SELECT COUNT(*) FROM {t}")
             print(f"CHK {t} rows={cnt}")
